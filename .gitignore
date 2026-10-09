@@ -24,3 +24,6 @@ results/
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Local data (not for version control)
+data/

@@ -42,6 +42,23 @@ interpreted):
     (Deferrable first, then Essential, Critical last) -- this is what makes the
     no-management rung the worst possible policy.
 
+Extended (180-day) study -- ``USE_EXTENDED = True``
+---------------------------------------------------
+On top of the 24 h study the script can propagate a *realistic* 408 km /
+92.6 min BIRDS-4 low-Earth orbit for ``SIM_DAYS = 180`` days at 1-minute
+resolution and fold in three slow degradation effects:
+
+  * orbit geometry - seasonal beta angle and the eclipse fraction it drives,
+                     with one contiguous eclipse per orbit (NASA TFAWS 2014);
+  * array          - 2.8 %/yr panel degradation (NASA ACTS 2005 + MDPI 2025,
+                     MinXSS) plus a MinXSS/XACT pointing (attitude) loss;
+  * battery        - 0.02 % capacity loss per orbit cycle (NASA PCoE),
+                     floored at 30 % total loss.
+
+The flag ``USE_EXTENDED`` at the top of the configuration section selects the
+driver: ``False`` runs only the original 24 h study, ``True`` runs the
+180-day extension (the 24 h code path and its plots are left intact).
+
 Outputs
 -------
     results/metrics.csv          summary table (mean/std per metric per strategy)
@@ -53,6 +70,12 @@ Outputs
     results/plot5_payload_*.png  payload energy per strategy
     results/plot6_tradeoff_*.png uptime vs payload trade-off
     results/plot7_predictor_*.png predictor error over time
+    results/ext_metrics.csv      180-day summary table (same columns as above)
+    results/ext_metrics_trials.csv  180-day raw metrics
+    results/plot_ext_soc.png     SoC over 180 days, all strategies
+    results/plot_ext_harvest.png harvest over 180 days, before/after degradation
+    results/plot_ext_eclipse.png eclipse fraction vs day (beta angle overlay)
+    results/plot_ext_metrics.png metric bar charts over 180 days
 """
 
 from __future__ import annotations
@@ -75,19 +98,68 @@ import matplotlib.pyplot as plt
 # 1. GLOBAL CONFIGURATION
 # =============================================================================
 
+# ---- study driver flag -----------------------------------------------------
+# USE_EXTENDED selects which driver main() runs:
+#   False -> only the original 24 h Monte-Carlo study (plots 1-7, metrics.csv)
+#   True  -> the 180-day extension (plot_ext_*.png, ext_metrics*.csv); the
+#            original 24 h simulation is left untouched and still runs when
+#            the flag is flipped back to False.
+USE_EXTENDED = True
+
 # ---- time base -------------------------------------------------------------
 DT_MIN = 1.0                       # [min] simulation time step
 DT_H = DT_MIN / 60.0               # [h]   simulation time step
 N_STEPS = 1440                     # 24 h at 1-minute resolution
 HOURS_AXIS = np.arange(N_STEPS) * DT_MIN / 60.0
 
-# ---- orbital geometry ------------------------------------------------------
-ORBIT_PERIOD_MIN = 1440.0          # [min] synthetic orbit == one simulated day
+# ---- orbital geometry (original 24 h study: synthetic one-day orbit) -------
+# The legacy study models one 24 h revolution, so these constants keep their
+# original values under the *_24H names; the extension uses the realistic
+# constants below instead (its eclipse is recomputed every day).
+ORBIT_PERIOD_MIN_24H = 1440.0      # [min] synthetic orbit == one simulated day
 DAYLIGHT_MIN = 18.0 * 60.0         # [min] sunlit arc per orbit (18 h)
-ECLIPSE_MIN = 360.0                # [min] umbral (eclipse) segment, 6 h
+ECLIPSE_MIN_24H = 360.0            # [min] umbral (eclipse) segment, 6 h
 # Eclipse start offset window: the eclipse has to fit inside the daylight arc, so
 # the start can be anywhere in [0, DAYLIGHT - ECLIPSE] = [0, 12 h].
-ECLIPSE_OFFSET_RANGE = (0.0 * 60.0, DAYLIGHT_MIN - ECLIPSE_MIN)
+ECLIPSE_OFFSET_RANGE = (0.0 * 60.0, DAYLIGHT_MIN - ECLIPSE_MIN_24H)
+
+# ---- orbital geometry (180-day extension: realistic LEO orbit) -------------
+# NASA TFAWS 2014 (orbit geometry); BIRDS-4 (BRICSat-C) 408 km sun-synchronous
+# orbit, 92.6 min period.  The fixed 6 h ECLIPSE_MIN of the synthetic study is
+# gone here: every day recomputes the eclipse from the beta angle instead.
+ALTITUDE_KM = 408.0                # [km] circular orbit altitude
+EARTH_RADIUS_KM = 6371.0           # [km] mean Earth radius (umbral cone)
+ORBIT_PERIOD_MIN = 92.6            # [min] BIRDS-4 orbital period
+BETA_ANGLE_MIN = 0.0               # [deg] beta-angle at the start of the window
+BETA_ANGLE_MAX = 23.45             # [deg] Earth obliquity -> seasonal beta swing
+BETA_PERIOD_DAYS = 365.0           # [d] beta angle repeats once per year
+ECLIPSE_PHASE_MIN = 0.0            # [min] every orbit starts at eclipse entry, so
+                                   #       the eclipse is one contiguous block
+                                   #       beginning at this fixed orbit phase
+
+# ---- array degradation (NASA ACTS 2005 + MDPI 2025; MinXSS) ---------------
+DEGRADATION_PER_YEAR = 0.028       # [-] 2.8 %/year end-of-life loss (MinXSS)
+DEGRADATION_START_DAY = 0          # [d] degradation clock starts at mission day 0
+
+# ---- attitude / pointing effects (MinXSS XACT) ----------------------------
+POINTING_ERROR_ARCSEC = 25.0       # [arcsec] worst-case XACT pointing error
+# cos-loss of a normally-illuminated array for that error (radians(25/3600)
+# converts arcsec -> deg -> rad); the resulting loss is tiny (physics!), so it
+# is bounded to at most 1 % by attitude_loss() below.
+POINTING_LOSS_FRACTION = 1.0 - np.cos(np.radians(POINTING_ERROR_ARCSEC / 3600.0))
+
+# ---- battery degradation (NASA PCoE) --------------------------------------
+BATTERY_CYCLE_DEGRADATION = 0.0002  # [-] 0.02 % capacity loss per charge cycle
+CYCLES_PER_DAY = 1440.0 / ORBIT_PERIOD_MIN  # [-] orbits (cycles) per 24 h day
+
+# ---- extended (180-day) run length ---------------------------------------
+SIM_DAYS = 180                     # [d]  mission length of the extension
+STEPS_PER_DAY = 1440               # [min/d] 1-minute resolution (1440 min/day)
+N_STEPS_TOTAL = SIM_DAYS * STEPS_PER_DAY  # [min] total extended time steps
+# Number of Monte-Carlo trials used by the 180-day extension.  A 180-day run is
+# ~180x longer than the 24 h study, so the extended sweep uses fewer trials than
+# N_TRIALS to keep the script runnable; the aggregation is over these trials.
+EXT_N_TRIALS = 3                   # [-] extended-run Monte-Carlo trials
 
 # ---- array (solar panel) ---------------------------------------------------
 PANEL_PEAK_W = 155.0               # [W] clear-sky array power at normal incidence
@@ -227,6 +299,103 @@ def cloud_clearness(rng: np.random.Generator, n: int, mean_gap: float, mean_dur:
 
 
 # =============================================================================
+# 2b. EXTENDED PHYSICS MODEL  (180-day extension)
+# =============================================================================
+# Sources: NASA TFAWS 2014 (beta angle + eclipse geometry of a circular LEO
+# orbit), NASA ACTS 2005 + MDPI 2025 / MinXSS (array degradation), MinXSS
+# XACT spec (attitude / pointing loss), NASA PCoE (battery cycle degradation).
+
+
+def beta_angle(day_of_year: float) -> float:
+    """
+    Seasonal orbit beta angle [deg] for a mission day (NASA TFAWS 2014).
+
+    The orbit plane precesses once a year against the Earth-Sun line, so the
+    sun's elevation above the orbit plane (the beta angle) swings between
+    BETA_ANGLE_MIN and BETA_ANGLE_MAX with a one-year period.  Over the first
+    180 days the sine sweeps 0 -> 23.45 -> ~1 deg, i.e. the eclipse season
+    slowly opens and closes inside the mission window.
+    """
+    # beta = BETA_ANGLE_MAX * sin(2*pi * day_of_year / BETA_PERIOD_DAYS)
+    # (BETA_ANGLE_MIN is the lower bound of the seasonal swing and is 0 deg.)
+    beta = BETA_ANGLE_MAX * np.sin(2.0 * np.pi * day_of_year / BETA_PERIOD_DAYS)
+    beta = BETA_ANGLE_MIN + beta
+    return float(beta)
+
+
+def eclipse_fraction(beta_deg: float) -> float:
+    """
+    Fraction of one orbit spent inside the Earth's umbral cone, in [0, 1]
+    (NASA TFAWS 2014, circular-orbit eclipse geometry).
+
+        sin_theta = sqrt( (1/cos^2 beta) * ((Re/(Re+h))^2 - sin^2 beta) )
+        theta     = asin(sin_theta)             # umbral half-angle [rad]
+        eclipse   = (2*theta) / (2*pi)          # umbral arc / full circle
+
+    If the argument of the square root goes negative the sun never enters the
+    umbral cone (end of the eclipse season) and the fraction is 0.
+
+    NOTE on the drafting formula ``1 - (2*theta)/(2*pi)``: with theta = asin()
+    above that expression is the *sunlit* fraction, i.e. the complement of the
+    umbral arc.  It returns 0.611 at beta = 0 and grows towards 1 as the
+    eclipse season closes, which contradicts the "no eclipse season -> 0"
+    branch.  The complement, (2*theta)/(2*pi), is the physical eclipse
+    fraction: 0.389 at beta = 0, i.e. 36.0 min of the 92.6 min BIRDS-4 orbit
+    (ISS-class reality), smoothly decaying to 0 when the season ends.  The
+    sunlit fraction is computed first below so both expressions are visible.
+    """
+    beta = np.radians(beta_deg)
+    h = ALTITUDE_KM
+    Re = EARTH_RADIUS_KM
+    arg = (1.0 / np.cos(beta) ** 2) * ((Re / (Re + h)) ** 2 - np.sin(beta) ** 2)
+    if arg < 0.0:
+        return 0.0                       # no eclipse season at this beta
+    sin_theta = np.sqrt(arg)
+    theta = np.arcsin(sin_theta)         # umbral half-angle [rad]
+    sunlit_fraction = 1.0 - (2.0 * theta) / (2.0 * np.pi)
+    eclipse_fraction = 1.0 - sunlit_fraction   # == (2*theta) / (2*pi)
+    return float(np.clip(eclipse_fraction, 0.0, 1.0))
+
+
+def panel_degradation(day: int) -> float:
+    """
+    Solar-array power multiplier at mission ``day`` (NASA ACTS 2005 + MDPI
+    2025, MinXSS measured 2.8 %/year degradation), linear in time and floored
+    at 15 % total loss (factor >= 0.85).
+    """
+    years = max(day - DEGRADATION_START_DAY, 0) / 365.0
+    factor = 1.0 - DEGRADATION_PER_YEAR * years
+    return float(max(factor, 0.85))
+
+
+def attitude_loss(day: int) -> float:
+    """
+    Fractional harvest loss caused by spacecraft attitude / pointing error at
+    mission ``day`` (MinXSS XACT: 25 arcsec worst case).
+
+    Base loss is the cosine loss of POINTING_LOSS_FRACTION, modulated by a
+    slow sinusoidal variation over the 180-day mission (attitude knowledge and
+    thermal wobble drift with beta angle / season) and bounded to [0, 0.01],
+    i.e. at most a 1 % harvest loss as required.
+    """
+    base = POINTING_LOSS_FRACTION
+    loss = base + 0.5 * base * np.sin(2.0 * np.pi * day / 180.0)
+    return float(np.clip(loss, 0.0, 0.01))
+
+
+def battery_capacity(day: int) -> float:
+    """
+    Battery capacity multiplier at mission ``day`` (NASA PCoE cycle-life
+    data): every orbit is roughly one deep cycle, each costing
+    BATTERY_CYCLE_DEGRADATION of the nameplate capacity, floored at 30 %
+    total loss (factor >= 0.70).
+    """
+    cycles = day * CYCLES_PER_DAY
+    factor = 1.0 - BATTERY_CYCLE_DEGRADATION * cycles
+    return float(max(factor, 0.70))
+
+
+# =============================================================================
 # 3. SCENARIO GENERATION  (identical for every strategy in a given trial)
 # =============================================================================
 
@@ -240,7 +409,8 @@ class Geometry:
     """
 
     def __init__(self, shape_ext: np.ndarray, n: int,
-                 sunrise_min: float = 0.0, daylight_min: float = DAYLIGHT_MIN):
+                 sunrise_min: float = 0.0, daylight_min: float = DAYLIGHT_MIN,
+                 treat_all_dark_as_eclipse: bool = False):
         self.shape = shape_ext
         self.n = n
         lit = shape_ext > 0.0
@@ -251,6 +421,10 @@ class Geometry:
         # the daylight bounds, so they are passed in (defaults = the canonical
         # geometry used by make_scenario).  Both the base orbit and the tiled
         # copy are covered.
+        # NASA TFAWS 2014 (extended study): the realistic ephemeris has no
+        # separate orbital night -- every dark minute of a 92.6 min LEO orbit
+        # is eclipse -- so ``treat_all_dark_as_eclipse=True`` classifies every
+        # dark run as an eclipse segment and the daylight-bounds test is moot.
         day0 = int(round(sunrise_min / DT_MIN))
         day1 = int(round((sunrise_min + daylight_min) / DT_MIN))
         arcs = [(k * n + day0, k * n + day1) for k in range(2) if k * n + day1 <= m]
@@ -261,7 +435,7 @@ class Geometry:
                 j = i
                 while j < m and not lit[j]:
                     j += 1
-                if any(a <= i and j <= b for a, b in arcs):
+                if treat_all_dark_as_eclipse or any(a <= i and j <= b for a, b in arcs):
                     segs.append((i, j))                     # [start, end) eclipse
                 i = j
             else:
@@ -359,6 +533,14 @@ class Scenario:
     geom: Geometry              # pre-computed segment lengths / plan horizons
     horizon_steps: np.ndarray   # [n] look-ahead length per step (identical per strategy)
     dark_hours: np.ndarray      # [n] hours of continuous eclipse/night ahead
+    # ---- extended-physics fields (default = legacy 24 h synthetic study) ----
+    # NASA TFAWS 2014 / NASA ACTS 2005 / MDPI 2025 / NASA PCoE.
+    orbit_period_min: float = ORBIT_PERIOD_MIN_24H   # [-] EWMA / ephemeris period
+    beta_deg: Optional[np.ndarray] = None            # [SIM_DAYS] beta angle per day
+    eclipse_frac: Optional[np.ndarray] = None        # [SIM_DAYS] eclipse fraction/day
+    harvest_ideal: Optional[np.ndarray] = None       # [n] harvest w/o degradation
+    degradation: Optional[np.ndarray] = None         # [n] panel degradation factor
+    attitude: Optional[np.ndarray] = None            # [n] attitude loss fraction
 
     @property
     def n(self) -> int:
@@ -385,7 +567,7 @@ def make_scenario(trial: int) -> Scenario:
     # The window opens at sunrise; the eclipse starts at a random offset inside
     # the daylight arc, so every trial gets the same 12 h of sunlit time but a
     # different eclipse/night geometry to plan around.
-    ecl_len = ECLIPSE_MIN
+    ecl_len = ECLIPSE_MIN_24H
     ecl_start = rng.uniform(*ECLIPSE_OFFSET_RANGE)
     sunrise = 0.0
     daylight = DAYLIGHT_MIN
@@ -424,6 +606,133 @@ def make_scenario(trial: int) -> Scenario:
         geom=geom,
         horizon_steps=horizon_steps,
         dark_hours=dark_hours,
+    )
+
+
+def make_extended_scenario(trial: int) -> Scenario:
+    """
+    Build a randomised 180-day scenario with realistic orbital mechanics.
+
+    This is the extended-study counterpart of ``make_scenario``.  It reuses the
+    same per-trial seeding so all strategies face identical weather, eclipse
+    geometry, initial SoC and degradation, but it spans ``N_STEPS_TOTAL`` minutes
+    and folds in the three slow physical effects (requirements 1-3, 5-8, 14-15):
+
+      * orbit geometry   - the eclipse fraction is recomputed from the seasonal
+                           beta angle *every day* and applied as one contiguous
+                           block per 92.6 min orbit at a fixed phase (NASA TFAWS
+                           2014);
+      * array            - 2.8 %/yr panel degradation plus the MinXSS XACT
+                           pointing loss are multiplied into the realised harvest
+                           (NASA ACTS 2005 + MDPI 2025, MinXSS);
+      * battery          - capacity fade is not baked into the scenario -- it is
+                           applied per step in ``simulate_extended_trial`` so the
+                           SoC fraction uses the instantaneous capacity (NASA
+                           PCoE).
+
+    The nested ``day`` / ``minute`` loop below is exactly the structure required
+    by the study (one eclipse window per orbit, recomputed each day) and builds
+    both the (noisy) realised harvest and the ideal, un-degraded harvest used by
+    the pre/post-degradation comparison plot.
+    """
+    seed = BASE_SEED + 1009 * trial
+    rng = np.random.default_rng(seed)
+
+    n = N_STEPS_TOTAL
+    period = ORBIT_PERIOD_MIN
+
+    # -- randomised scenario parameters (same distributions as the 24 h study) --
+    cloud_gap = rng.uniform(*CLOUD_GAP_RANGE)      # mean clear-sky gap length
+    cloud_dur = rng.uniform(*CLOUD_DUR_RANGE)      # mean cloud-gap duration
+    soc0_frac = rng.uniform(*SOA0_RANGE)           # initial state of charge
+
+    # -- per-day orbital geometry (NASA TFAWS 2014) --------------------------
+    # beta_angle() sweeps 0 -> 23.45 -> ~0 deg over the 180 days, so the eclipse
+    # fraction it drives slowly opens and closes across the mission.
+    beta_day = np.array([beta_angle(d) for d in range(SIM_DAYS)], dtype=float)
+    ecl_frac_day = np.array([eclipse_fraction(b) for b in beta_day], dtype=float)
+    ecl_min_day = ecl_frac_day * period             # [min] eclipse per orbit, per day
+
+    # -- ephemeris + harvest (nested day / minute loop, requirement 12) -------
+    # ``shape`` is the clear-sky geometry over the whole mission *plus* a tail of
+    # PLAN_HORIZON_MIN_MAX minutes so the planner can look past the last simulated
+    # minute; the tail simply continues the same orbit geometry.
+    ext = int(PLAN_HORIZON_MIN_MAX / DT_MIN)
+    shape = np.zeros(n + ext + 1)
+    clearness = cloud_clearness(rng, n, cloud_gap, cloud_dur)
+    harvest = np.zeros(n)          # realised (degraded) array power [W]
+    harvest_ideal = np.zeros(n)    # pre-degradation array power [W]
+    degradation = np.ones(n)       # panel degradation factor per step
+    attitude = np.zeros(n)         # attitude loss fraction per step
+
+    for day in range(SIM_DAYS):
+        # Requirement 4: eclipse length is recomputed from the day's beta angle.
+        ecl_minutes = ecl_min_day[day]
+        sun_arc = max(period - ecl_minutes, 1e-9)
+        deg_day = panel_degradation(day)            # NASA ACTS 2005 / MDPI 2025
+        att_day = attitude_loss(day)                # MinXSS XACT pointing loss
+        for minute in range(STEPS_PER_DAY):
+            step = day * STEPS_PER_DAY + minute
+            # Orbit phase within the 92.6 min orbit: one contiguous eclipse
+            # starting at ECLIPSE_PHASE_MIN (fixed orbital phase), then sun.
+            phase = (step * DT_MIN - ECLIPSE_PHASE_MIN) % period
+            if phase < ecl_minutes:
+                sun = 0.0                            # inside the umbral eclipse
+            else:
+                sun = float(np.sin(np.pi * (phase - ecl_minutes) / sun_arc))
+            shape[step] = sun
+            # Ideal harvest (geometry x cloud), then the two slow losses applied
+            # to the realised harvest exactly as required (steps 7 and 10).
+            ideal = PANEL_PEAK_W * sun * clearness[step]
+            harvest_ideal[step] = ideal
+            degradation[step] = deg_day
+            attitude[step] = att_day
+            harvest[step] = ideal * deg_day * (1.0 - att_day)
+
+    # -- plan the orbit-geometry tail (only the ephemeris is needed there) -----
+    for step in range(n, n + ext + 1):
+        day = step // STEPS_PER_DAY
+        ecl_minutes = eclipse_fraction(beta_angle(day)) * period
+        sun_arc = max(period - ecl_minutes, 1e-9)
+        phase = (step * DT_MIN - ECLIPSE_PHASE_MIN) % period
+        shape[step] = 0.0 if phase < ecl_minutes else float(
+            np.sin(np.pi * (phase - ecl_minutes) / sun_arc))
+
+    # -- battery / capacity bookkeeping --------------------------------------
+    capacity = BAT_CAPACITY_WH * battery_capacity(0)   # day-0 (fresh) capacity
+    soc0 = soc0_frac * capacity
+
+    # -- ephemeris classification + per-step planning look-ahead --------------
+    # In the realistic LEO ephemeris every dark minute is eclipse, so the
+    # daylight-embedded-eclipse test is replaced by treat_all_dark_as_eclipse.
+    geom = Geometry(shape, n, treat_all_dark_as_eclipse=True)
+    horizon_steps = np.array([geom.horizon(i) for i in range(n)], dtype=int)
+    dark_hours = np.array([geom.dark_hours(i) for i in range(n)], dtype=float)
+
+    return Scenario(
+        trial=trial,
+        seed=seed,
+        capacity_wh=capacity,
+        nameplate_wh=BAT_CAPACITY_WH,
+        soc0_wh=soc0,
+        fade_frac=0.0,
+        eclipse_start_min=ECLIPSE_PHASE_MIN,
+        eclipse_len_min=float(ecl_min_day[0]),
+        sunrise_min=0.0,
+        daylight_min=DAYLIGHT_MIN,
+        shape=shape[:n],
+        clearness=clearness,
+        harvest_w=harvest,
+        shape_ext=shape,
+        geom=geom,
+        horizon_steps=horizon_steps,
+        dark_hours=dark_hours,
+        orbit_period_min=period,
+        beta_deg=beta_day,
+        eclipse_frac=ecl_frac_day,
+        harvest_ideal=harvest_ideal,
+        degradation=degradation,
+        attitude=attitude,
     )
 
 
@@ -539,12 +848,16 @@ class SeasonalForecaster:
     ``z(confidence) * sigma(k)``.
     """
 
-    def __init__(self, shape_ext: np.ndarray, use_residual: bool, orbit_period_min: float = ORBIT_PERIOD_MIN):
+    def __init__(self, shape_ext: np.ndarray, use_residual: bool,
+                 orbit_period_min: float = ORBIT_PERIOD_MIN_24H,
+                 n_steps: int = N_STEPS):
         self.shape = shape_ext
         self.use_residual = use_residual
         # Seasonal (orbit-matched) EWMA: alpha = 1 - exp(-dt / tau_orbit).
         # tau_orbit == the orbit period makes this a *seasonal* term: it only
-        # tracks slow, orbit-scale changes in the average clearness.
+        # tracks slow, orbit-scale changes in the average clearness.  The 24 h
+        # study passes the synthetic 1440 min orbit, the extension the real
+        # 92.6 min BIRDS-4 period.
         self.alpha_level = 1.0 - np.exp(-DT_MIN / orbit_period_min)
         self.alpha_dev = 1.0 - np.exp(-DT_MIN / RESID_TAU_MIN)
         self.alpha_slow = 1.0 - np.exp(-DT_MIN / RESID_SLOW_TAU_MIN)
@@ -569,9 +882,11 @@ class SeasonalForecaster:
         # confidence / traces
         self.conf = "LOW"
         self.lead_plot = 30              # [min] lead shown in the error plot
-        self.trace_pred = np.full(N_STEPS, np.nan)   # point forecast at lead_plot (W)
-        self.trace_htot = np.full(N_STEPS, np.nan)   # total forecast over horizon (Wh)
-        self.trace_conf = np.full(N_STEPS, np.nan)
+        # Diagnostic traces are sized to the simulated window: 1440 steps for
+        # the 24 h study, N_STEPS_TOTAL (259 200) for the 180-day extension.
+        self.trace_pred = np.full(n_steps, np.nan)   # point forecast at lead_plot (W)
+        self.trace_htot = np.full(n_steps, np.nan)   # total forecast over horizon (Wh)
+        self.trace_conf = np.full(n_steps, np.nan)
         self._lk = np.array(sorted(self.gain.keys()), dtype=float)
         self._gv = np.zeros_like(self._lk)
         self._bv = np.zeros_like(self._lk)
@@ -938,7 +1253,15 @@ class PredictiveFSM(Strategy):
 
     def reset(self, scen: Scenario) -> None:
         super().reset(scen)
-        self.fc = SeasonalForecaster(scen.shape_ext, use_residual=self.use_residual)
+        # The seasonal EWMA time constant follows the scenario's orbit period
+        # (1440 min for the synthetic 24 h study, 92.6 min for the extension)
+        # and the diagnostic traces are sized to the simulated window.
+        self.fc = SeasonalForecaster(
+            scen.shape_ext,
+            use_residual=self.use_residual,
+            orbit_period_min=getattr(scen, "orbit_period_min", ORBIT_PERIOD_MIN_24H),
+            n_steps=scen.n,
+        )
         self.state = "NOMINAL"
         self.state_t = 0                  # minutes spent in the current state
         self.cand = "NOMINAL"             # debounce candidate
@@ -1380,6 +1703,121 @@ def simulate_trial(scen: Scenario, strategy: Strategy) -> TrialResult:
     return res_obj
 
 
+def simulate_extended_trial(scen: Scenario, strategy: Strategy) -> TrialResult:
+    """
+    Run the 180-day mission for one strategy on one extended scenario.
+
+    Identical in structure to ``simulate_trial`` except for the two extended
+    physics hooks mandated by the study:
+
+      * the battery capacity is no longer constant -- each minute uses
+        ``BAT_CAPACITY_WH * battery_capacity(day)`` (NASA PCoE cycle fade), so
+        the bus balance, the SoC fraction and the ''is the bus in brownout?''
+        test all track the instantaneous capacity (requirement 16);
+      * the realised harvest already carries the per-day panel degradation and
+        attitude loss because ``make_extended_scenario`` folded them in.
+
+    Keeping this as a separate driver leaves the original 24 h path byte-for-byte
+    intact (requirement 20).
+    """
+    strat = strategy
+    strat.reset(scen)
+    n = scen.n
+
+    soc = np.empty(n)
+    soc_frac = np.empty(n)          # soc / instantaneous (faded) capacity
+    served = {t: np.empty(n) for t in LOADS}
+    enabled = {t: np.empty(n, dtype=bool) for t in LOADS}
+    states = np.full(n, -1, dtype=int)
+    margin = np.full(n, np.nan)
+    reserve = np.full(n, np.nan)
+    soc_hist = np.empty(n)
+    pred_trace = np.full(n, np.nan) if getattr(strat, "uses_forecast", False) else None
+    conf_trace = np.full(n, np.nan) if pred_trace is not None else None
+
+    bo_latch = False
+    dd_latch = False
+    n_brownout = 0
+    n_deep = 0
+    n_crit_down = 0
+    switches = {"critical": 0, "essential": 0, "deferrable": 0}
+    prev_en = {"critical": True, "essential": True, "deferrable": True}
+    dsum = np.zeros(n)
+    payload_wh = 0.0
+    crit_ok = 0
+    ess_ok = 0
+    htot = np.full(n, np.nan)
+
+    s = float(scen.soc0_wh)
+    for i in range(n):
+        day = i // STEPS_PER_DAY
+        # Instantaneous faded battery capacity (NASA PCoE), floored at 70 %.
+        cap = BAT_CAPACITY_WH * battery_capacity(day)
+        soc_hist[i] = s
+        ctx = Context(i=i, soc_wh=s, cap_wh=cap, harvest_w=float(scen.harvest_w[i]),
+                      shape_now=float(scen.shape[i]), soc_hist=soc_hist[: i + 1])
+        dec = strat.step(ctx)
+
+        load_w = sum(LOAD_W[t] for t in LOADS if dec.enable.get(t, True))
+        res = bus_step(s, cap, load_w, ctx.harvest_w, dec.enable)
+
+        s = res.soc_wh
+        soc[i] = s
+        soc_frac[i] = s / cap
+        for t in LOADS:
+            served[t][i] = res.served_wh[t]
+            on = bool(dec.enable.get(t, True))
+            enabled[t][i] = on
+            if on != prev_en[t]:
+                switches[t] += 1
+                prev_en[t] = on
+        if dec.state in FSM_STATE_ID:
+            states[i] = FSM_STATE_ID[dec.state]
+        margin[i] = dec.margin_wh
+        reserve[i] = dec.reserve_wh
+        if pred_trace is not None:
+            pred_trace[i] = strat.fc.trace_pred[i]
+            conf_trace[i] = strat.fc.trace_conf[i]
+            htot[i] = strat.fc.trace_htot[i]
+
+        f = s / cap
+        crit_ok += int(res.critical_met)
+        ess_ok += int(res.served_wh["essential"] >= LOAD_W["essential"] * DT_H - 1e-12)
+        payload_wh += res.served_wh["deferrable"]
+        if f < BROWNOUT_SOC and not bo_latch:
+            bo_latch = True
+            n_brownout += 1
+        elif f >= BROWNOUT_SOC + 0.01:
+            bo_latch = False
+        if f < DEEP_DISCH_SOC and not dd_latch:
+            dd_latch = True
+            n_deep += 1
+        elif f >= DEEP_DISCH_SOC + 0.01:
+            dd_latch = False
+        if not res.critical_met:
+            n_crit_down += 1
+
+        H = int(scen.horizon_steps[i])
+        j = min(n, i + H)
+        dsum[i] = float(scen.harvest_w[i:j].sum()) * DT_H
+
+    res_obj = TrialResult(
+        strategy=strat.name, trial=scen.trial, soc=soc, soc_frac=soc_frac, served=served,
+        enabled=enabled, states=states, margin=margin, reserve=reserve,
+        pred=pred_trace, conf=conf_trace,
+    )
+    res_obj.metrics = compute_metrics(
+        res_obj, scen, n_brownout, n_deep, n_crit_down, switches, payload_wh, crit_ok, ess_ok
+    )
+    if pred_trace is not None:
+        sunlit = (scen.shape > 0.05) & (np.arange(n) + scen.horizon_steps <= n) & np.isfinite(htot)
+        res_obj.metrics["pred_mae_horizon_wh"] = float(np.abs(htot[sunlit] - dsum[sunlit]).mean())
+        res_obj.metrics["pred_mae_w"] = float(strat.fc.mae_w())
+    else:
+        res_obj.metrics["pred_mae_horizon_wh"] = float("nan")
+        res_obj.metrics["pred_mae_w"] = float("nan")
+    return res_obj
+
 
 # =============================================================================
 # 9. METRICS
@@ -1509,13 +1947,19 @@ def run_monte_carlo(n_trials: int = N_TRIALS, verbose: bool = True) -> Tuple[Dic
 # 11. REPORTING
 # =============================================================================
 
-def print_summary(agg: Dict[str, Dict[str, float]], h2h: Dict[str, Dict[str, float]], n_trials: int) -> None:
-    """Human-readable summary table (mean +/- std over the Monte-Carlo trials)."""
+def print_summary(agg: Dict[str, Dict[str, float]], h2h: Dict[str, Dict[str, float]],
+                  n_trials: int, title: Optional[str] = None) -> None:
+    """Human-readable summary table (mean +/- std over the Monte-Carlo trials).
+
+    ``title`` lets the 180-day extension reuse the exact same column layout
+    with its own header; the default keeps the original 24 h wording.
+    """
     cols = METRIC_COLS
     w0 = 12
     w1 = 21
     print("\n" + "=" * (w0 + w1 * len(STRATEGY_KEYS)))
-    print("SUMMARY -- mean +/- std over {} Monte-Carlo trials (identical scenarios per trial)".format(n_trials))
+    print(title if title is not None else
+          "SUMMARY -- mean +/- std over {} Monte-Carlo trials (identical scenarios per trial)".format(n_trials))
     print("=" * (w0 + w1 * len(STRATEGY_KEYS)))
     head = f"{'metric':<20s}" + "".join(f"{STRATEGY_LABELS[k]:>21s}" for k in STRATEGY_KEYS)
     print(head)
@@ -1541,12 +1985,16 @@ def print_summary(agg: Dict[str, Dict[str, float]], h2h: Dict[str, Dict[str, flo
 
 
 def write_csv(agg: Dict[str, Dict[str, float]], results: Dict[str, List[TrialResult]],
-              outdir: str = RESULTS_DIR) -> None:
-    """Write the summary table (metrics.csv) and the raw per-trial table."""
+              outdir: str = RESULTS_DIR, prefix: str = "") -> None:
+    """Write the summary table (metrics.csv) and the raw per-trial table.
+
+    ``prefix`` lets the 180-day extension write ext_metrics*.csv alongside the
+    24 h files instead of overwriting them (default "" keeps the old names).
+    """
     os.makedirs(outdir, exist_ok=True)
 
     # -- summary ---------------------------------------------------------
-    path = os.path.join(outdir, "metrics.csv")
+    path = os.path.join(outdir, prefix + "metrics.csv")
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["strategy", "label", "metric", "mean", "std", "min", "max"])
@@ -1557,7 +2005,7 @@ def write_csv(agg: Dict[str, Dict[str, float]], results: Dict[str, List[TrialRes
                             f"{agg[k][col + '_min']:.6g}", f"{agg[k][col + '_max']:.6g}"])
 
     # -- per-trial -------------------------------------------------------
-    path2 = os.path.join(outdir, "metrics_trials.csv")
+    path2 = os.path.join(outdir, prefix + "metrics_trials.csv")
     with open(path2, "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(["strategy", "trial", "seed"] + [c for c, _ in METRIC_COLS])
@@ -1809,6 +2257,225 @@ def plot_results(all_res: Dict[str, List[TrialResult]], agg: Dict[str, Dict[str,
 # 13. MAIN
 # =============================================================================
 
+def _ext_representative(all_res: Dict[str, List[TrialResult]],
+                        scenarios: Sequence[Scenario]) -> int:
+    """
+    Representative extended trial for the time-domain plot: the one whose
+    unmanaged minimum SoC is closest to the median (same idea as
+    ``pick_representative`` but tolerant of a small extended trial count).
+    """
+    mins = np.array([r.metrics["min_soc_pct"] for r in all_res["NO_MGMT"]], dtype=float)
+    if mins.size == 0:
+        return scenarios[0].trial
+    med = float(np.median(mins))
+    idx = int(np.argmin(np.abs(mins - med)))
+    return int(all_res["NO_MGMT"][idx].trial)
+
+
+def plot_ext_soc(all_res: Dict[str, List[TrialResult]], scen: Scenario, trial: int,
+                 outdir: str) -> str:
+    """Extended plot 1: battery SoC over the 180-day mission, all strategies."""
+    fig, ax = plt.subplots(figsize=(12, 5.4))
+    colors = plt.cm.tab10(np.linspace(0, 1, 10))
+    days_axis = np.arange(scen.n) * DT_MIN / STEPS_PER_DAY     # [d]
+    stride = 5                                                 # 5-min downsample
+    for c, k in enumerate(STRATEGY_KEYS):
+        r = next(x for x in all_res[k] if x.trial == trial)
+        ax.plot(days_axis[::stride], 100.0 * r.soc_frac[::stride], lw=0.6,
+                color=colors[c], alpha=0.85, label=STRATEGY_LABELS[k])
+    for frac, lbl, ls in ((BROWNOUT_SOC, "brownout 5 %", ":"),
+                          (DEEP_DISCH_SOC, "deep disch 10 %", "--"),
+                          (RESERVE_FRAC, "reserve 20 %", "-.")):
+        ax.axhline(100 * frac, color="k", lw=0.7, ls=ls, alpha=0.6)
+        ax.text(0.5, 100 * frac + 0.8, lbl, fontsize=7, color="k", alpha=0.7)
+    ax.set_xlabel("mission time [d]")
+    ax.set_ylabel("battery SoC [%]")
+    ax.set_xlim(0, SIM_DAYS)
+    ax.set_ylim(0, 100)
+    ax.set_title(f"Extended plot 1 - SoC over {SIM_DAYS} days "
+                 f"(trial {trial}, sustainable LEO + degradation)")
+    ax.legend(fontsize=8, ncol=3, loc="lower left")
+    ax.grid(True, alpha=0.25, lw=0.6)
+    fig.tight_layout()
+    p = os.path.join(outdir, "plot_ext_soc.png")
+    fig.savefig(p, dpi=PLOT_DPI)
+    plt.close(fig)
+    return p
+
+
+def plot_ext_harvest(scen: Scenario, outdir: str) -> str:
+    """Extended plot 2: daily harvest before vs after degradation + loss curve."""
+    ideal = scen.harvest_ideal
+    real = scen.harvest_w
+    if ideal is None or real is None:
+        return ""
+    # daily mean array power [W] (reshape 180 x 1440 and average over the day)
+    ideal_d = ideal.reshape(SIM_DAYS, STEPS_PER_DAY).mean(axis=1)
+    real_d = real.reshape(SIM_DAYS, STEPS_PER_DAY).mean(axis=1)
+    # daily mean combined degradation * (1 - attitude) factor
+    factor = (scen.degradation * (1.0 - scen.attitude)).reshape(SIM_DAYS, STEPS_PER_DAY).mean(axis=1)
+    days = np.arange(SIM_DAYS)
+
+    fig, ax = plt.subplots(figsize=(12, 5.0))
+    ax.plot(days, ideal_d, lw=1.4, color="tab:orange", label="harvest before degradation")
+    ax.plot(days, real_d, lw=1.4, color="tab:blue", label="harvest after degradation")
+    ax.set_xlabel("mission time [d]")
+    ax.set_ylabel("daily mean array power [W]")
+    ax.set_xlim(0, SIM_DAYS)
+    ax.grid(True, alpha=0.25, lw=0.6)
+    ax.legend(fontsize=8, loc="upper right")
+
+    ax2 = ax.twinx()
+    ax2.plot(days, 100.0 * factor, lw=1.0, ls="--", color="0.35",
+             label="array capability (degr. x attitude)")
+    ax2.set_ylabel("array capability [% of nameplate]")
+    ax2.set_ylim(96.0, 100.5)
+    ax2.legend(fontsize=8, loc="lower left")
+    ax.set_title(f"Extended plot 2 - array harvest over {SIM_DAYS} days "
+                 f"(2.8 %/yr panel + MinXSS attitude loss)")
+    fig.tight_layout()
+    p = os.path.join(outdir, "plot_ext_harvest.png")
+    fig.savefig(p, dpi=PLOT_DPI)
+    plt.close(fig)
+    return p
+
+
+def plot_ext_eclipse(scen: Scenario, outdir: str) -> str:
+    """Extended plot 3: eclipse fraction and beta angle vs day (NASA TFAWS 2014)."""
+    beta = scen.beta_deg
+    ecl = scen.eclipse_frac
+    if beta is None or ecl is None:
+        return ""
+    days = np.arange(beta.size)
+    ecl_min = ecl * ORBIT_PERIOD_MIN
+
+    fig, ax = plt.subplots(figsize=(12, 5.0))
+    ax.plot(days, 100.0 * ecl, lw=1.5, color="tab:purple",
+            label="eclipse fraction of orbit")
+    ax.set_xlabel("mission time [d]")
+    ax.set_ylabel("eclipse fraction [% of orbit]")
+    ax.set_xlim(0, SIM_DAYS)
+    ax.grid(True, alpha=0.25, lw=0.6)
+    ax.legend(fontsize=8, loc="upper right")
+
+    ax2 = ax.twinx()
+    ax2.plot(days, beta, lw=1.2, ls="--", color="tab:red", label="beta angle")
+    ax2.set_ylabel("beta angle [deg]")
+    ax2.legend(fontsize=8, loc="lower left")
+    ax.set_title(f"Extended plot 3 - eclipse fraction vs beta angle, {SIM_DAYS} days "
+                 f"(alt={ALTITUDE_KM:.0f} km, T={ORBIT_PERIOD_MIN:.1f} min, "
+                 f"{np.mean(ecl_min):.1f} min mean eclipse)")
+    fig.tight_layout()
+    p = os.path.join(outdir, "plot_ext_eclipse.png")
+    fig.savefig(p, dpi=PLOT_DPI)
+    plt.close(fig)
+    return p
+
+
+def plot_ext_metrics(agg: Dict[str, Dict[str, float]], n_trials: int, outdir: str) -> str:
+    """Extended plot 4: bar charts of the key metrics aggregated over 180 days."""
+    labels = [STRATEGY_LABELS[k] for k in STRATEGY_KEYS]
+    panels = [
+        ("crit_uptime_pct", "critical uptime [%]", "tab:blue"),
+        ("ess_uptime_pct", "essential uptime [%]", "tab:green"),
+        ("min_soc_pct", "min SoC [%]", "tab:red"),
+        ("payload_wh", "payload energy [Wh]", "tab:orange"),
+    ]
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8.0))
+    for ax, (col, ylabel, color) in zip(axes.ravel(), panels):
+        m = [agg[k][col + "_mean"] for k in STRATEGY_KEYS]
+        s = [agg[k][col + "_std"] for k in STRATEGY_KEYS]
+        _bar(ax, labels, m, s, ylabel,
+             f"{ylabel} over {SIM_DAYS} d ({n_trials} trials)", color)
+    fig.suptitle(f"Extended plot 4 - EPS metrics over {SIM_DAYS} days "
+                 f"(mean +/- std, {n_trials} trials)", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    p = os.path.join(outdir, "plot_ext_metrics.png")
+    fig.savefig(p, dpi=PLOT_DPI)
+    plt.close(fig)
+    return p
+
+
+def plot_ext_results(all_res: Dict[str, List[TrialResult]], agg: Dict[str, Dict[str, float]],
+                     scenarios: Sequence[Scenario], n_trials: int,
+                     outdir: str = RESULTS_DIR) -> List[str]:
+    """Generate the four required 180-day extension figures."""
+    os.makedirs(outdir, exist_ok=True)
+    trial = _ext_representative(all_res, scenarios)
+    scen = next(s for s in scenarios if s.trial == trial)
+    paths = [
+        plot_ext_soc(all_res, scen, trial, outdir),
+        plot_ext_harvest(scen, outdir),
+        plot_ext_eclipse(scen, outdir),
+        plot_ext_metrics(agg, n_trials, outdir),
+    ]
+    for p in paths:
+        if p:
+            print(f"wrote {p}")
+    return paths
+
+
+def run_strategy_extended(scenarios: Sequence[Scenario], key: str) -> List[TrialResult]:
+    """Run one strategy over every extended scenario (shared scenarios)."""
+    out = []
+    for scen in scenarios:
+        out.append(simulate_extended_trial(scen, make_strategy(key)))
+    return out
+
+
+def run_extended(n_trials: int = EXT_N_TRIALS, verbose: bool = True) -> None:
+    """
+    180-day extension driver (requirements 11-19).
+
+    Builds the extended scenarios once, runs every strategy on the *same*
+    scenarios, then reuses the 24 h reporting/plotting machinery where it is
+    strategy-agnostic (aggregate / head_to_head / print_summary / write_csv) and
+    adds the four extended figures.  The 24 h plots already on disk are left
+    untouched (requirement 19).
+    """
+    print("=" * 78)
+    print("Study 3 - EXTENDED EPS energy budgeting (180-day realistic LEO)")
+    print(f"  {N_STEPS_TOTAL} steps @ {DT_MIN:g} min = {SIM_DAYS} d, "
+          f"altitude {ALTITUDE_KM:.0f} km, orbit {ORBIT_PERIOD_MIN:.1f} min")
+    print(f"  beta angle {BETA_ANGLE_MIN:.0f}..{BETA_ANGLE_MAX:.2f} deg "
+          f"(period {BETA_PERIOD_DAYS:.0f} d, NASA TFAWS 2014)")
+    print(f"  panel degradation {100*DEGRADATION_PER_YEAR:.1f} %/yr (floor 15 %), "
+          f"attitude cosine loss {POINTING_LOSS_FRACTION:.2e} "
+          f"(<= {100.0*np.clip(1.5*POINTING_LOSS_FRACTION, 0.0, 0.01):.2e} % cap)")
+    print(f"  battery cycle fade {100*BATTERY_CYCLE_DEGRADATION:.2f} %/cycle "
+          f"(floor 30 %, {CYCLES_PER_DAY:.1f} cycles/d)")
+    print(f"  Monte Carlo: {n_trials} extended trials, master seed {BASE_SEED}")
+    print("=" * 78)
+
+    scenarios = [make_extended_scenario(t) for t in range(n_trials)]
+    all_res: Dict[str, List[TrialResult]] = {}
+    for key in STRATEGY_KEYS:
+        all_res[key] = run_strategy_extended(scenarios, key)
+        if verbose:
+            up = np.nanmean([r.metrics["crit_uptime_pct"] for r in all_res[key]])
+            pl = np.nanmean([r.metrics["payload_wh"] for r in all_res[key]])
+            print(f"  ran {key:<11s} n={n_trials:3d}  uptime={up:6.2f}%  payload={pl:9.1f} Wh")
+
+    flat = [r for k in STRATEGY_KEYS for r in all_res[k]]
+    agg = aggregate(flat)
+    h2h = head_to_head(flat)
+
+    print_summary(agg, h2h, n_trials,
+                  title=f"EXTENDED SUMMARY -- {SIM_DAYS}-day mean +/- std over "
+                        f"{n_trials} trials (identical scenarios per trial)")
+    write_csv(agg, all_res, RESULTS_DIR, prefix="ext_")
+    plot_ext_results(all_res, agg, scenarios, n_trials, RESULTS_DIR)
+
+    best_react = h2h["best_reactive"]
+    print("\n" + "-" * 78)
+    print(f"EXTENDED CONCLUSION ({SIM_DAYS} days)")
+    print(f"  best reactive rung        : {best_react}")
+    print(f"  PREDICT_5 wins uptime in  : {h2h['PREDICT_5']['win_uptime_pct']:.0f}% of trials")
+    print(f"  PREDICT_5 wins payload in : {h2h['PREDICT_5']['win_payload_pct']:.0f}% of trials")
+    print(f"  PREDICT_5 wins both in    : {h2h['PREDICT_5']['win_both_pct']:.0f}% of trials")
+    print("-" * 78 + "\n")
+
+
 def print_step60_diagnostic(scen: Scenario) -> None:
     """
     Single-step transparency dump: run PREDICT_5 for 61 minutes of trial 0 and
@@ -1845,15 +2512,16 @@ def print_step60_diagnostic(scen: Scenario) -> None:
     print("-" * 78 + "\n")
 
 
-def main() -> None:
+def run_24h() -> None:
+    """Original 24 h Monte-Carlo study (unchanged behaviour, plots 1-7)."""
     print("=" * 78)
     print("Study 3 - EPS energy budgeting: reactive vs predictive vs oracle")
     print(f"  {N_STEPS} steps @ {DT_MIN:g} min = {N_STEPS * DT_MIN / 60:.0f} h, "
           f"panel {PANEL_PEAK_W:g} W peak, battery {BAT_CAPACITY_WH:g} Wh")
     print(f"  loads: critical {W_CRITICAL:g} W / essential {W_ESSENTIAL:g} W / "
           f"deferrable {W_DEFERRABLE:g} W")
-    print(f"  orbit: {ORBIT_PERIOD_MIN / 60:.0f} h period, {DAYLIGHT_MIN / 60:.0f} h daylight, "
-          f"{ECLIPSE_MIN / 60:.0f} h eclipse (offset randomised per trial)")
+    print(f"  orbit: {ORBIT_PERIOD_MIN_24H / 60:.0f} h period, {DAYLIGHT_MIN / 60:.0f} h daylight, "
+          f"{ECLIPSE_MIN_24H / 60:.0f} h eclipse (offset randomised per trial)")
     print(f"  Monte Carlo: {N_TRIALS} trials, master seed {BASE_SEED}")
     print("=" * 78)
     print("Oracle omitted — see README for rationale.")
@@ -1882,6 +2550,19 @@ def main() -> None:
     print(f"  PREDICT_5 wins payload in : {p5['win_payload_pct']:.0f}% of trials")
     print(f"  PREDICT_5 wins both in    : {p5['win_both_pct']:.0f}% of trials")
     print("-" * 78 + "\n")
+
+
+def main() -> None:
+    """
+    Study driver selected by the top-level ``USE_EXTENDED`` flag:
+    ``False`` -> the original 24 h Monte-Carlo study; ``True`` -> the 180-day
+    realistic-orbit extension.  The two paths are independent, so flipping the
+    flag never changes or deletes the other study's outputs.
+    """
+    if USE_EXTENDED:
+        run_extended()
+    else:
+        run_24h()
 
 
 if __name__ == "__main__":
