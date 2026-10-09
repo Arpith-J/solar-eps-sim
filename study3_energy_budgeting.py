@@ -659,11 +659,18 @@ def make_extended_scenario(trial: int) -> Scenario:
     # minute; the tail simply continues the same orbit geometry.
     ext = int(PLAN_HORIZON_MIN_MAX / DT_MIN)
     shape = np.zeros(n + ext + 1)
-    clearness = cloud_clearness(rng, n, cloud_gap, cloud_dur)
-    harvest = np.zeros(n)          # realised (degraded) array power [W]
-    harvest_ideal = np.zeros(n)    # pre-degradation array power [W]
+    # Cloud series: generated day-by-day from the same two-state (clear/cloudy)
+    # statistics as the 24 h path (CLOUD_GAP_RANGE / CLOUD_DUR_RANGE /
+    # CLOUD_ATTEN_RANGE), driven by the per-trial RNG so every strategy in a
+    # trial sees identical weather.  ``clearness`` stores the resulting
+    # transmission factor (1 - cloud_atten) for reporting.
+    clearness = np.ones(n)
+    harvest = np.zeros(n)          # realised (cloud + degradation + attitude) power [W]
+    harvest_ideal = np.zeros(n)    # weather-only array power [W] (pre-degradation)
     degradation = np.ones(n)       # panel degradation factor per step
     attitude = np.zeros(n)         # attitude loss fraction per step
+
+    p_cloud = 1.0 - np.exp(-1.0 / max(cloud_gap, 1e-9))   # cloud hazard per minute
 
     for day in range(SIM_DAYS):
         # Requirement 4: eclipse length is recomputed from the day's beta angle.
@@ -671,6 +678,23 @@ def make_extended_scenario(trial: int) -> Scenario:
         sun_arc = max(period - ecl_minutes, 1e-9)
         deg_day = panel_degradation(day)            # NASA ACTS 2005 / MDPI 2025
         att_day = attitude_loss(day)                # MinXSS XACT pointing loss
+
+        # -- cloud events for this day (generated per day, per-trial seed) ----
+        # A two-state process: cloud gaps arrive with mean spacing cloud_gap and
+        # persist for a geometrically distributed cloud_dur; while a cloud is
+        # active, cloud_atten ~ U(CLOUD_ATTEN_RANGE) and the array is attenuated
+        # by the transmission factor (1 - cloud_atten).
+        cloud_atten_day = np.zeros(STEPS_PER_DAY)
+        k = 0
+        while k < STEPS_PER_DAY:
+            if rng.random() < p_cloud:
+                dur = int(max(1, rng.geometric(1.0 / max(cloud_dur, 1e-9))))
+                dur = min(dur, STEPS_PER_DAY - k)
+                cloud_atten_day[k : k + dur] = rng.uniform(*CLOUD_ATTEN_RANGE)
+                k += dur
+            else:
+                k += 1
+
         for minute in range(STEPS_PER_DAY):
             step = day * STEPS_PER_DAY + minute
             # Orbit phase within the 92.6 min orbit: one contiguous eclipse
@@ -681,9 +705,12 @@ def make_extended_scenario(trial: int) -> Scenario:
             else:
                 sun = float(np.sin(np.pi * (phase - ecl_minutes) / sun_arc))
             shape[step] = sun
-            # Ideal harvest (geometry x cloud), then the two slow losses applied
-            # to the realised harvest exactly as required (steps 7 and 10).
-            ideal = PANEL_PEAK_W * sun * clearness[step]
+            # Cloud attenuation on top of the slow losses (requirements 1-4):
+            #   harvest = P_peak * geometry * (1 - cloud_atten)
+            #                     * panel_degradation * (1 - attitude_loss)
+            cloud_trans = 1.0 - cloud_atten_day[minute]
+            clearness[step] = cloud_trans
+            ideal = PANEL_PEAK_W * sun * cloud_trans
             harvest_ideal[step] = ideal
             degradation[step] = deg_day
             attitude[step] = att_day
