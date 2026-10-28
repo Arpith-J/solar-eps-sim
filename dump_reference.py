@@ -393,6 +393,7 @@ class Esp32Controller:
         self.rec_bad = 0                   # g_recBad
         self.prev_d_on = False             # g_prevDOn
         self.hw_trip = False               # g_hwTrip (never set by the harness)
+        self.safe_reset_timer = 0         # latch timer for SAFE_MODE reset
 
     # -- fsmGoto (lines 469-481) -------------------------------------------
     def _goto(self, new_s):
@@ -491,24 +492,30 @@ class Esp32Controller:
                         np.float32(RESERVE_LOW_FRAC
                                    if fc.band == BAND_LOW
                                    else RESERVE_BASE_FRAC))
-        if self.state == ST_DEGRADED:
-            deg_res = float(np.float32(BAT_CAPACITY_WH) *
-                            np.float32(RESERVE_LOW_FRAC))
-            if deg_res > reserve:
-                reserve = deg_res
         margin = (float(soc_prev) + f_harvest_wh
                   - f_load_wh - float(reserve))
 
         # 5. margin-driven target state (branch order as in the C++)
         prev_state = self.state
         if self.state == ST_SAFE_MODE:
-            target = (ST_RECOVERY
-                      if (socf >= FSM_SAFE_SOC_CLEAR and margin >= 0.0)
-                      else ST_SAFE_MODE)
+            # LATCHED SAFE_MODE - must wait for reset command
+            # Simulate reset: soc >= 20% AND margin >= 0 for 15 consecutive minutes
+            if not hasattr(self, 'safe_reset_timer'):
+                self.safe_reset_timer = 0
+            if socf >= 0.20 and margin >= 0.0:
+                self.safe_reset_timer += 1
+                if self.safe_reset_timer >= 15:
+                    target = ST_RECOVERY
+                    self.safe_reset_timer = 0
+                else:
+                    target = ST_SAFE_MODE
+            else:
+                self.safe_reset_timer = 0
+                target = ST_SAFE_MODE
         elif self.state == ST_RECOVERY:
             target = self._recovery_target(np.float32(socf),
                                            np.float32(margin))
-        elif margin < MARGIN_CRITICAL_WH:
+        elif margin < MARGIN_CRITICAL_WH or socf < DEEP_DISCH_SOC or self.hw_trip:
             target = ST_SAFE_MODE
         elif margin < MARGIN_SHED_ESS_WH:
             target = ST_CRITICAL
@@ -517,11 +524,10 @@ class Esp32Controller:
         else:
             target = ST_NOMINAL
 
-        # 6. hard SoC floor -> SAFE_MODE (guard skipped while already SAFE)
-        if socf < DEEP_DISCH_SOC and self.state != ST_SAFE_MODE:
-            target = ST_SAFE_MODE
-        if self.hw_trip:
-            target = ST_SAFE_MODE
+        # 6. hard SoC floor -> SAFE_MODE (guard)
+        if self.state != ST_SAFE_MODE:
+            if socf < DEEP_DISCH_SOC or self.hw_trip or margin < MARGIN_CRITICAL_WH:
+                target = ST_SAFE_MODE
         self._debounced(target)
 
         # 7. load set implied by the NEW state

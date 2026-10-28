@@ -459,6 +459,7 @@ static float    g_soc     = BAT_SOC0;     // battery SoC [Wh], AFTER update
 // flag from its trip detector / ISR; while set, the FSM is forced to
 // SAFE_MODE.
 static volatile bool g_hwTrip = false;
+static int g_safeResetTimer = 0;
 
 void setHardwareTrip(bool tripped) { g_hwTrip = tripped; }
 
@@ -599,20 +600,27 @@ static void stepManager(long t, float harvestW) {
   float reserve = BAT_CAPACITY_WH *
                   ((g_fc.band == BAND_LOW) ? RESERVE_LOW_FRAC
                                             : RESERVE_BASE_FRAC);   // 1399
-  if (g_state == ST_DEGRADED) {                             // lines 1400-1401
-    float degRes = BAT_CAPACITY_WH * RESERVE_LOW_FRAC;
-    if (degRes > reserve) reserve = degRes;
-  }
   double margin = (double)socPrev + fHarvestWh - (double)fLoadWh - (double)reserve;
 
   // --- margin-driven target state (lines 1405-1419) ----------------------
   FsmState target = g_state;
-  if (g_state == ST_SAFE_MODE) {                            // lines 1407-1408
-    target = (socf >= FSM_SAFE_SOC_CLEAR && margin >= 0.0) ? ST_RECOVERY
-                                                           : ST_SAFE_MODE;
+  if (g_state == ST_SAFE_MODE) {                            // LATCHED SAFE_MODE
+    // For simulation, simulate reset command: soc >= 20% AND margin >= 0 for 15 consecutive minutes
+    if (socf >= 0.20 && margin >= 0.0) {
+      g_safeResetTimer++;
+      if (g_safeResetTimer >= 15) {
+        target = ST_RECOVERY;
+        g_safeResetTimer = 0;
+      } else {
+        target = ST_SAFE_MODE;
+      }
+    } else {
+      g_safeResetTimer = 0;
+      target = ST_SAFE_MODE;
+    }
   } else if (g_state == ST_RECOVERY) {                      // lines 1409-1410
     target = recoveryTarget((float)socf, (float)margin);
-  } else if (margin < MARGIN_CRITICAL_WH) {                 // lines 1412-1413
+  } else if (margin < MARGIN_CRITICAL_WH || socf < DEEP_DISCH_SOC || g_hwTrip) {
     target = ST_SAFE_MODE;
   } else if (margin < MARGIN_SHED_ESS_WH) {                 // lines 1414-1415
     target = ST_CRITICAL;
@@ -620,16 +628,6 @@ static void stepManager(long t, float harvestW) {
     target = ST_DEGRADED;
   } else {                                                  // lines 1418-1419
     target = ST_NOMINAL;
-  }
-
-  // Hard SoC floor -> SAFE_MODE (deep-discharge guard, lines 1421-1423)
-  if (socf < DEEP_DISCH_SOC && g_state != ST_SAFE_MODE) {
-    target = ST_SAFE_MODE;
-  }
-  // Hardware trip (requirement 5): protection overrides everything and, since
-  // SAFE_MODE has the highest severity, the escalation is immediate.
-  if (g_hwTrip) {
-    target = ST_SAFE_MODE;
   }
   fsmDebounced(target);                                     // line 1424
 
